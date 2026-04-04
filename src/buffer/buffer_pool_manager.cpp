@@ -16,43 +16,153 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager *disk_manager
 BufferPoolManager::~BufferPoolManager() { delete[] pages_; }
 
 auto BufferPoolManager::NewPage(page_id_t *page_id) -> Page * {
-  // TODO(student): Allocate a new page in the buffer pool
-  // 1. Pick a victim frame from free list or replacer
-  // 2. If victim is dirty, write it back to disk
-  // 3. Allocate a new page_id via disk_manager_
-  // 4. Update page_table_ and page metadata
-  throw NotImplementedException("BufferPoolManager::NewPage");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  frame_id_t frame_id = INVALID_FRAME_ID;
+  if (!free_list_.empty()) {
+    frame_id = free_list_.front();
+    free_list_.pop_front();
+  } else if (!replacer_->Evict(&frame_id)) {
+    return nullptr;
+  }
+
+  auto &frame = pages_[frame_id];
+  if (frame.page_id_ != INVALID_PAGE_ID) {
+    if (frame.is_dirty_) {
+      disk_manager_->WritePage(frame.page_id_, frame.GetData());
+    }
+    page_table_.erase(frame.page_id_);
+  }
+
+  const page_id_t new_page_id = disk_manager_->AllocatePage();
+  *page_id = new_page_id;
+
+  frame.ResetMemory();
+  frame.page_id_ = new_page_id;
+  frame.pin_count_ = 1;
+  frame.is_dirty_ = false;
+
+  page_table_[new_page_id] = frame_id;
+  replacer_->RecordAccess(frame_id);
+  replacer_->SetEvictable(frame_id, false);
+
+  return &frame;
 }
 
 auto BufferPoolManager::FetchPage(page_id_t page_id) -> Page * {
-  // TODO(student): Fetch a page from the buffer pool
-  // 1. Search page_table_ for existing mapping
-  // 2. If not found, pick a victim frame
-  // 3. Read page from disk into the frame
-  throw NotImplementedException("BufferPoolManager::FetchPage");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it != page_table_.end()) {
+    auto &frame = pages_[it->second];
+    frame.pin_count_++;
+    replacer_->RecordAccess(it->second);
+    replacer_->SetEvictable(it->second, false);
+    return &frame;
+  }
+
+  frame_id_t frame_id = INVALID_FRAME_ID;
+  if (!free_list_.empty()) {
+    frame_id = free_list_.front();
+    free_list_.pop_front();
+  } else if (!replacer_->Evict(&frame_id)) {
+    return nullptr;
+  }
+
+  auto &frame = pages_[frame_id];
+  if (frame.page_id_ != INVALID_PAGE_ID) {
+    if (frame.is_dirty_) {
+      disk_manager_->WritePage(frame.page_id_, frame.GetData());
+    }
+    page_table_.erase(frame.page_id_);
+  }
+
+  disk_manager_->ReadPage(page_id, frame.GetData());
+  frame.page_id_ = page_id;
+  frame.pin_count_ = 1;
+  frame.is_dirty_ = false;
+
+  page_table_[page_id] = frame_id;
+  replacer_->RecordAccess(frame_id);
+  replacer_->SetEvictable(frame_id, false);
+  return &frame;
 }
 
 auto BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) -> bool {
-  // TODO(student): Unpin a page, decrementing pin count
-  // - If pin_count reaches 0, set evictable in replacer
-  throw NotImplementedException("BufferPoolManager::UnpinPage");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    return false;
+  }
+
+  auto &frame = pages_[it->second];
+  if (frame.pin_count_ <= 0) {
+    return false;
+  }
+
+  frame.pin_count_--;
+  frame.is_dirty_ = frame.is_dirty_ || is_dirty;
+  if (frame.pin_count_ == 0) {
+    replacer_->SetEvictable(it->second, true);
+  }
+  return true;
 }
 
 auto BufferPoolManager::DeletePage(page_id_t page_id) -> bool {
-  // TODO(student): Delete a page from the buffer pool
-  // - Page must have pin_count == 0
-  // - Remove from page_table_, reset memory, add frame to free_list_
-  throw NotImplementedException("BufferPoolManager::DeletePage");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    disk_manager_->DeallocatePage(page_id);
+    return true;
+  }
+
+  const frame_id_t frame_id = it->second;
+  auto &frame = pages_[frame_id];
+  if (frame.pin_count_ > 0) {
+    return false;
+  }
+
+  replacer_->SetEvictable(frame_id, true);
+  replacer_->Remove(frame_id);
+  page_table_.erase(it);
+
+  frame.ResetMemory();
+  frame.page_id_ = INVALID_PAGE_ID;
+  frame.pin_count_ = 0;
+  frame.is_dirty_ = false;
+  free_list_.push_back(frame_id);
+
+  disk_manager_->DeallocatePage(page_id);
+  return true;
 }
 
 auto BufferPoolManager::FlushPage(page_id_t page_id) -> bool {
-  // TODO(student): Force flush a page to disk regardless of dirty flag
-  throw NotImplementedException("BufferPoolManager::FlushPage");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  auto it = page_table_.find(page_id);
+  if (it == page_table_.end()) {
+    return false;
+  }
+
+  auto &frame = pages_[it->second];
+  disk_manager_->WritePage(page_id, frame.GetData());
+  frame.is_dirty_ = false;
+  return true;
 }
 
 void BufferPoolManager::FlushAllPages() {
-  // TODO(student): Flush all pages in the buffer pool to disk
-  throw NotImplementedException("BufferPoolManager::FlushAllPages");
+  std::lock_guard<std::mutex> guard(latch_);
+
+  for (size_t i = 0; i < pool_size_; ++i) {
+    auto &frame = pages_[i];
+    if (frame.page_id_ == INVALID_PAGE_ID) {
+      continue;
+    }
+    disk_manager_->WritePage(frame.page_id_, frame.GetData());
+    frame.is_dirty_ = false;
+  }
 }
 
 }  // namespace onebase
