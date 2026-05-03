@@ -16,13 +16,22 @@ void SeqScanExecutor::Init() {
 }
 
 auto SeqScanExecutor::Next(Tuple *tuple, RID *rid) -> bool {
+  const auto &schema = table_info_->schema_;
   while (iter_ != end_) {
-    Tuple current = *iter_;
+    Tuple raw = *iter_;
     RID current_rid = iter_.GetRID();
     ++iter_;
 
+    std::vector<Value> values;
+    values.reserve(schema.GetColumnCount());
+    for (uint32_t i = 0; i < schema.GetColumnCount(); ++i) {
+      values.push_back(raw.GetValue(&schema, i));
+    }
+    Tuple current(std::move(values));
+    current.SetRID(current_rid);
+
     if (plan_->GetPredicate() != nullptr) {
-      const auto pred = plan_->GetPredicate()->Evaluate(&current, &table_info_->schema_);
+      const auto pred = plan_->GetPredicate()->Evaluate(&current, &schema);
       if (!pred.GetAsBoolean()) {
         continue;
       }
